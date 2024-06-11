@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*.class
+.env
+.venv
+wandb/
+
+# Operating System Generated Files
+.DS_Store # MacOS folder metadata
+Thumbs.db # Windows thumbnail cache
+*.swp
+*.swo # Linux/Unix Vim swap files
+
+# Editor and IDE Specific Files
+.vscode/ # VSCode configuration files
+.idea/ # IntelliJ IDEA configuration files
+*.sublime-* # Sublime Text files
+.settings/ # Eclipse files
+
+# Build Output Directories
+# bin/
+# build/
+# out/ # Common build output directories
+# dist/ # Distribution directory for compiled code
+
+# Version Control System Folders
+.svn/
+CVS/ # Subversion and CVS folders
+
+# Temporary Files and Logs
+# *.log # Log files
+*.tmp
+*.temp # Temporary files
+
+# Security and Environment Files
+.env
+.env.local # Environment configuration files
+*.pem
+*.key # Private keys and certificate files
+
+# Database Files
+*.db
+*.sql
+*.sqlite # Database files
+
