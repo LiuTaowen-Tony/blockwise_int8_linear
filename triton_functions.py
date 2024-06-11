@@ -17,7 +17,7 @@ GROUP_SIZE = 128
 SHARED_EXP_TORCH_TYPE = torch.float32
 SHARED_EXP_TRITON_TYPE = types[SHARED_EXP_TORCH_TYPE]
 ACCUMULATOR_TYPE = tl.float32
-INPUT_OUTPUT_TORCH_TYPE = torch.float32
+INPUT_OUTPUT_TORCH_TYPE = torch.bfloat16
 
 def init_to_zero(name):
     return lambda nargs: nargs[name].zero_()
@@ -33,9 +33,9 @@ def get_configs_io_bound():
                         configs.append(
                             triton.Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': 1},
                                             num_stages=num_stages, num_warps=num_warps))
-                    for split_k in [2, 4, 8, 16]:
-                        configs.append(triton.Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': split_k},
-                                                        num_stages=num_stages, num_warps=num_warps, pre_hook=init_to_zero('C')))
+                        for split_k in [2, 4, 8, 16]:
+                            configs.append(triton.Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': split_k},
+                                                            num_stages=num_stages, num_warps=num_warps, pre_hook=init_to_zero('C')))
     return configs
 
 @triton.autotune(
