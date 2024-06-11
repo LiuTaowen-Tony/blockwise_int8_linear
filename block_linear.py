@@ -62,8 +62,9 @@ class blockwise_int8_linear(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             # grad_W = fast_matmulT(G.t(), X.t())
             grad_W = G.t().mm(X.to(G.dtype))
-            # g_int8, g_state = quantize_block_rowwise(G)
+            # ((Gt X)t)t = (Xt G)t
             # X_int8, x_state = quantize_block_rowwise(X)
+            # g_int8, g_state = quantize_block_rowwise(G)
             # grad_W = int8_matmul_block64_rowwise_dequantize(X_int8, g_int8.t(), g_state, x_state).t()
             # grad_W = fast_matmul(G.t(), X)
         if ctx.needs_input_grad[2]:
