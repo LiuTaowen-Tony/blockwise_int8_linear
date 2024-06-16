@@ -3,10 +3,15 @@ from functools import partial
 import torch
 import torch.nn as nn
 
+import torch.optim as optim
+
 from triton_functions import (
     int8_matmul_block64_rowwise_dequantize,
-    quantize_block_rowwise
+    quantize_block_rowwise,
+    dequantize_block_rowwise
 )
+
+QUANTISE_WEIGHT=True
 
 def replace_linear_with_blockwise_int8(model):
     to_be_replaced = []
@@ -24,6 +29,7 @@ def replace_linear_with_blockwise_int8(model):
         model._modules[name].weight.data = module.weight.data
         if module.bias is not None:
             model._modules[name].bias.data = module.bias.data
+    return model
 
 def fast_matmul(a, b):
     b = b.t()
@@ -99,6 +105,9 @@ class BlockInt8Linear(nn.Linear):
         if self.training:
             return blockwise_int8_linear.apply(x, self.weight, self.bias)
         else:
+            if QUANTISE_WEIGHT:
+                W_int8, state_W = quantize_block_rowwise(self.weight)
+                self.weight = dequantize_block_rowwise(W_int8, state_W)
             if not hasattr(self, "W_int8"):
                 return blockwise_int8_linear.apply(x, self.weight, self.bias)
 
@@ -109,6 +118,7 @@ class BlockInt8Linear(nn.Linear):
                 X_int8, self.W_int8.t(), state_X, self.state_W, self.bias
             ).view(*x.size()[:-1], -1)
 
+#class BlockInt8Linear()
 
 if __name__ == "__main__":
     from microxcaling.mx import finalize_mx_specs
