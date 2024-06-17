@@ -24,7 +24,7 @@ def init_to_zero(name):
 def get_configs_io_bound():
     configs = []
     for num_stages in [1, 2, 3, 4, 5, 6]:
-        for block_m in [16, 32, 64]:
+        for block_m in [16, 32, 64, 128]:
             for block_k in [block_linear_config.GROUP_SIZE]:
                 for block_n in [16, 32, 64, 128, 256]:
                     for num_warps in [2, 4, 8]:
@@ -58,7 +58,7 @@ def get_configs_io_bound():
     prune_configs_by={
         'early_config_prune': early_config_prune,
         'perf_model': estimate_matmul_time,
-        'top_k': 10
+        'top_k': 30
     },
 )
 @triton.heuristics({
