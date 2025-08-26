@@ -90,8 +90,9 @@ class blockwise_int8_linear(torch.autograd.Function):
             # grad_X = G.mm(W.to(G.dtype)).view(*G_3D.size()[:-1], -1)
             # grad_X = fast_matmul(G, W).view(*G_3D.size()[:-1], -1)
             g_int8, g_state = quantize_block_rowwise(G)
+            W = W.t().contiguous()
             W_int8, w_state = quantize_block_rowwise(W)
-            grad_X = int8_matmul_block64_rowwise_dequantize(g_int8, W_int8, g_state, w_state).view(*G_3D.size()[:-1], -1)
+            grad_X = int8_matmul_block64_rowwise_dequantize(g_int8, W_int8.t(), g_state, w_state).view(*G_3D.size()[:-1], -1)
         if ctx.needs_input_grad[1]:
             # grad_W = fast_matmulT(G.t(), X.t())
             # grad_W = G.t().mm(X.to(G.dtype))

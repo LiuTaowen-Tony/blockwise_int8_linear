@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from triton.ops.matmul_perf_model import early_config_prune, estimate_matmul_time
 import block_linear_config
+from torch_cublas_matmul_int8 import matmul_int8
+
 
 # This is a matmul kernel based on triton.ops.matmul
 # It is modified to support rowwise quantized input and columnwise quantized weight
@@ -231,6 +233,198 @@ def quantize_block_rowwise(x: torch.Tensor, fblock_size=None):
     return output, output_maxs
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        # Good config for fp8 inputs.
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4)
+    ],
+    key=['M', 'N', 'K'],
+    prune_configs_by={
+        'early_config_prune': early_config_prune,
+        'perf_model': estimate_matmul_time,
+        'top_k': 10
+    },
+)
+@triton.heuristics({
+    'EVEN_K': lambda args: args['K'] % (args['BLOCK_K'] * args['SPLIT_K']) == 0,
+})
+@triton.jit
+def _int8_matmul(A, B, C, bias, M, N, K, has_bias : tl.constexpr,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_cm, stride_cn,
+            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+            GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr, EVEN_K: tl.constexpr,
+            ACC_TYPE: tl.constexpr
+            ):
+    # matrix multiplication
+    pid = tl.program_id(0)
+    pid_z = tl.program_id(1)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    # re-order program ID for better L2 performance
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+    # do matrix multiplication
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    # pointers
+    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+
+    # rematerialize rm and rn to save registers
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for i in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+        if EVEN_K:
+            a = tl.load(A)
+            b = tl.load(B)
+        else:
+            k_remaining = K - i * (BLOCK_K * SPLIT_K)
+            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
+            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
+        result = tl.dot(a, b).to(ACC_TYPE)
+        
+        acc += result
+        A += BLOCK_K * SPLIT_K * stride_ak
+        B += BLOCK_K * SPLIT_K * stride_bk
+
+    # acc = (acc * divfactor)
+    acc = acc.to(C.dtype.element_ty)
+
+    if has_bias:
+        bias = tl.load(bias + rn, mask=rn < N, other=0).to(C.dtype.element_ty)
+        acc = acc + bias[None, :]
+
+    C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+    mask = (rm < M)[:, None] & (rn < N)[None, :]
+    # handles write-back with reduction-splitting
+    if SPLIT_K == 1:
+        tl.store(C, acc, mask=mask)
+    else:
+        tl.atomic_add(C, acc, mask=mask)
+
+
+def int8_matmul(a, b, bias=None):
+
+
+    has_bias = 0 if bias is None else 1
+
+    device = a.device
+    # handle non-contiguous inputs if necessary
+    if a.stride(0) > 1 and a.stride(1) > 1:
+        a = a.contiguous()
+    if b.stride(0) > 1 and b.stride(1) > 1:
+        b = b.contiguous()
+    # checks constraints
+    # print(a.shape, b.shape)
+    assert a.shape[1] == b.shape[0], "incompatible dimensions"
+    M, K = a.shape
+    _, N = b.shape
+    # allocates output
+    c = torch.empty((M, N), device=device, dtype=block_linear_config.INPUT_OUTPUT_TORCH_TYPE)
+    # accumulator types
+    # launch int8_matmul_rowwise_dequantize kernel
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
+    compiled = _int8_matmul[grid](a, b, c, bias, M, N, K, has_bias,
+                    a.stride(0), a.stride(1),
+                    b.stride(0), b.stride(1),
+                    c.stride(0), c.stride(1),
+                    GROUP_M=8, ACC_TYPE=tl.int32)
+    return c
+
+
+@triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=1),
+            triton.Config({}, num_warps=2),
+            triton.Config({}, num_warps=4),
+            triton.Config({}, num_warps=8),
+            triton.Config({}, num_stages=1, num_warps=2),
+            triton.Config({}, num_stages=2, num_warps=2),
+            triton.Config({}, num_stages=4, num_warps=2),
+            triton.Config({}, num_stages=8, num_warps=2),
+            triton.Config({}, num_stages=1, num_warps=4),
+            triton.Config({}, num_stages=2, num_warps=4),
+            triton.Config({}, num_stages=4, num_warps=4),
+            triton.Config({}, num_stages=8, num_warps=4),
+            triton.Config({}, num_stages=1, num_warps=8),
+            triton.Config({}, num_stages=2, num_warps=8),
+            triton.Config({}, num_stages=4, num_warps=8),
+            triton.Config({}, num_stages=8, num_warps=8),
+        ],
+        key=['n_elements']
+)
+@triton.jit
+def _quantize_block_rowwise(
+    x_ptr,
+    output_ptr,
+    output_maxs,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    FBLOCK_SIZE: tl.constexpr,
+    n_elements
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * K
+    offsets = block_start + tl.arange(0, FBLOCK_SIZE)
+    output_maxs_offset = pid 
+    
+    for _ in range(0, tl.cdiv(K, FBLOCK_SIZE)):
+        row_mask = offsets < block_start + K
+        x = tl.load(x_ptr + offsets, mask=row_mask)
+        abs_x = tl.abs(x)
+        max_val = tl.max(tl.where(row_mask, abs_x, 0.), axis=0)
+        output = tl.math.llrint(127. * (x / max_val))
+        tl.store(output_ptr + offsets, output, mask=row_mask)
+        tl.store(output_maxs + output_maxs_offset, max_val)
+        offsets += FBLOCK_SIZE
+        output_maxs_offset += M
+
+def ceil_div(n, d):
+    return -(n // -d)
+
+def quantize_block_rowwise(x: torch.Tensor, fblock_size=None):
+    fblock_size = fblock_size or block_linear_config.GROUP_SIZE
+    m, k = x.shape
+
+    output = torch.empty(*x.shape, device=x.device, dtype=torch.int8)
+    # output_maxs is transposed
+    output_maxs = torch.empty((ceil_div(k, fblock_size), m), device=x.device, dtype=block_linear_config.SHARED_EXP_TORCH_TYPE)
+
+    assert x.is_cuda and output.is_cuda
+    grid = lambda meta: (x.shape[0],)
+    n_elements = output.numel()
+    _quantize_block_rowwise[grid](x, output, output_maxs, M=m, K=k, FBLOCK_SIZE=fblock_size, n_elements=n_elements)
+    return output, output_maxs
+
+
+
+
 def groupwise_quantize(x, K):
     # Reshape x into (-1, K), assuming x.size(0) is divisible by K
     # Use view or reshape to adjust x to the shape (N/K, K)
@@ -330,11 +524,11 @@ def copy_then_matmul(a, b):
         x_vals=[1024 * i for i in range(2, 16, 2)],  # Different possible values for `x_name`
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
-        line_vals=['cublas', 'blockwise_int8', 'blockwise_int8_quantise', 'cublas+copy'],
+        line_vals=['cublas', 'blockwise_int8', 'blockwise_int8_quantise', 'cublas+copy', 'int8 matmul'],
         # Label name for the lines
-        line_names=["cuBLAS", "blockwise_int8", 'blockwise_int8_quantise', 'cuBLAS+copy'],
+        line_names=["cuBLAS", "blockwise_int8", 'blockwise_int8_quantise', 'cuBLAS+copy', 'int8 matmul'],
         # Line styles
-        styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('black', '-')],
+        styles=[('green', '-'), ('blue', '-'), ('red', '-'), ('black', '-'), ('orange', '-')],
         ylabel="TFLOPS",  # Label name for the y-axis
         plot_name="matmul-performance",  # Name for the plot, used also as a file name for saving the plot.
         args={},
@@ -350,6 +544,12 @@ def benchmark(M, N, K, provider):
         a = a.to(torch.bfloat16)
         b = b.to(torch.bfloat16)
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
+    if provider == 'int8 matmul':
+        a_int8, a_state = quantize_block_rowwise(a)
+        b_int8, b_state = quantize_block_rowwise(b)
+        b_int8 = b_int8.t().contiguous().t()
+        
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: int8_matmul(a_int8, b_int8), quantiles=quantiles)
     if provider == 'blockwise_int8':
         b = b.t().contiguous()
         a, state_x = quantize_block_rowwise(a)
